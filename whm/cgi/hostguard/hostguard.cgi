@@ -4,194 +4,197 @@
 # HostGuard Pro - WHM Plugin Interface
 # /usr/local/cpanel/whostmgr/docroot/cgi/hostguard/hostguard.cgi
 #
-# Uses cPanel's native Cpanel::Form for parameter parsing and raw HTTP
-# headers as required by cpsrvd (cPanel's built-in web server).
-# Do NOT use CGI.pm - cpsrvd does not support it reliably.
+# Follows the exact same pattern as CSF's cgi to ensure cpsrvd compatibility:
+# - BEGIN block for lib paths
+# - Cpanel::Form::parseform() for parameters
+# - Whostmgr::ACLS for authentication
+# - Raw print for HTTP header
+# - NO CGI.pm, NO CGI::Carp
 ###############################################################################
+
+BEGIN {
+    unshift @INC, '/usr/local/hostguard/lib';
+    unshift @INC, '/usr/local/cpanel';
+}
+
 use strict;
 use Fcntl qw(:DEFAULT :flock);
 use POSIX qw(strftime);
 
-use lib '/usr/local/hostguard/lib';
-
-# --- WHM Authentication (cPanel native) ---
-my $has_cpanel = 0;
-eval {
-    use lib '/usr/local/cpanel';
-    require Cpanel::Form;
-    require Whostmgr::ACLS;
-    Whostmgr::ACLS::init_acls();
-    $has_cpanel = 1;
-};
-
-if ($has_cpanel && !Whostmgr::ACLS::hasroot()) {
-    print "Content-type: text/html\r\n\r\n";
-    print "<h2>Access Denied</h2><p>Root access required for HostGuard Pro.</p>";
-    exit;
-}
-
-# --- Parse form parameters (cPanel native way, like CSF does) ---
-my %FORM;
-if ($has_cpanel) {
-    %FORM = Cpanel::Form::parseform();
-} else {
-    %FORM = _parse_form_fallback();
-}
-
-# --- Raise rlimits if available (like CSF) ---
-eval {
-    require Cpanel::Rlimit;
-    Cpanel::Rlimit::set_rlimit_to_infinity();
-};
-
-# --- Load HostGuard modules with error trapping ---
-my ($config, %conf);
-my $load_error = '';
-
-eval {
-    require HGConfig;
-    require HGLogger;
-};
-if ($@) {
-    print "Content-type: text/html\r\n\r\n";
-    print "<h2>HostGuard Pro - Module Load Error</h2><pre>$@</pre>";
-    print "<p>Check that /usr/local/hostguard/lib/ contains HGConfig.pm and HGLogger.pm</p>";
-    exit;
-}
-
-eval {
-    $config = HGConfig->loadconfig();
-    %conf = $config->config();
-    HGLogger->init(
-        file  => $conf{LOG_FILE} || '/var/log/hostguard/daemon.log',
-        level => $conf{LOG_LEVEL} || 1,
-    );
-};
-if ($@) {
-    $load_error = "Config load error: $@";
-}
-
-my $action   = $FORM{action}  || 'dashboard';
-my $do       = $FORM{do}      || '';
-
 ###############################################################################
-# Rate limiting for POST actions
-###############################################################################
-my $RATE_FILE = ($HGConfig::DATA_DIR || '/var/lib/hostguard') . '/whm_ratelimit';
-
-sub check_rate_limit {
-    my $now = time();
-    my $window = 5;
-    if (-f $RATE_FILE) {
-        if (open(my $fh, '<', $RATE_FILE)) {
-            my $last = <$fh>;
-            close($fh);
-            chomp $last if $last;
-            if ($last && ($now - $last) < $window) {
-                return 0;
-            }
-        }
-    }
-    if (open(my $fh, '>', $RATE_FILE)) {
-        print $fh $now;
-        close($fh);
-    }
-    return 1;
-}
-
-###############################################################################
-# Process POST actions
-###############################################################################
-my $message  = '';
-my $msg_type = 'info';
-
-if ($ENV{REQUEST_METHOD} && $ENV{REQUEST_METHOD} eq 'POST' && $do) {
-    if (!check_rate_limit()) {
-        $message = "Rate limited. Please wait a few seconds between actions.";
-        $msg_type = 'warning';
-    } elsif ($load_error) {
-        $message = "Cannot perform actions: $load_error";
-        $msg_type = 'danger';
-    } else {
-        ($message, $msg_type) = process_post_action($do);
-        # Refresh config after actions
-        eval {
-            $config = HGConfig->loadconfig();
-            %conf = $config->config();
-        };
-    }
-}
-
-###############################################################################
-# Output HTTP header + HTML
+# CRITICAL: Print header FIRST so cpsrvd never returns a bare 500.
+# If anything below dies, the user sees the error in-page instead of
+# a generic "Internal Server Error" from cpsrvd.
 ###############################################################################
 print "Content-type: text/html\r\n\r\n";
 
-print_html_header();
-print_nav($action);
-
-if ($load_error) {
-    print qq(<div class="alert alert-danger">) . html_escape($load_error) . qq(</div>\n);
+# Wrap the entire CGI body in eval so any die/croak is caught
+eval {
+    _main();
+};
+if ($@) {
+    # If _main() died, show the error in the page instead of a 500
+    my $err = $@;
+    $err =~ s/&/&amp;/g;
+    $err =~ s/</&lt;/g;
+    $err =~ s/>/&gt;/g;
+    print "<html><body><h2>HostGuard Pro - Error</h2><pre>$err</pre>";
+    print "<p>Check file permissions and Perl module paths.</p></body></html>";
 }
-if ($message) {
-    print qq(<div class="alert alert-$msg_type">) . html_escape($message) . qq(</div>\n);
-}
-
-# Route to page
-if    ($action eq 'dashboard')      { page_dashboard(); }
-elsif ($action eq 'config')         { page_config(); }
-elsif ($action eq 'allowlist')      { page_list('allow'); }
-elsif ($action eq 'denylist')       { page_list('deny'); }
-elsif ($action eq 'ignorelist')     { page_list('ignore'); }
-elsif ($action eq 'tempblocks')     { page_tempblocks(); }
-elsif ($action eq 'services')       { page_services(); }
-elsif ($action eq 'logs')           { page_logs(); }
-elsif ($action eq 'search_results') { page_search_results(); }
-else                                { page_dashboard(); }
-
-print_html_footer();
 exit;
+
+###############################################################################
+# Main entry point - everything runs inside this so the eval catches all errors
+###############################################################################
+sub _main {
+
+    # --- WHM Authentication (cPanel native) ---
+    my $has_cpanel = 0;
+    eval {
+        require Cpanel::Form;
+        require Whostmgr::ACLS;
+        Whostmgr::ACLS::init_acls();
+        $has_cpanel = 1;
+    };
+
+    if ($has_cpanel) {
+        if (!Whostmgr::ACLS::hasroot()) {
+            print "<h2>Access Denied</h2><p>Root access required for HostGuard Pro.</p>";
+            return;
+        }
+    }
+
+    # --- Parse form parameters ---
+    my %FORM;
+    if ($has_cpanel) {
+        %FORM = Cpanel::Form::parseform();
+    } else {
+        %FORM = _parse_form_fallback();
+    }
+
+    # --- Raise rlimits if available (like CSF) ---
+    eval {
+        require Cpanel::Rlimit;
+        Cpanel::Rlimit::set_rlimit_to_infinity();
+    };
+
+    # --- Load HostGuard modules with error trapping ---
+    my ($config, %conf);
+    my $load_error = '';
+
+    eval {
+        require HGConfig;
+        require HGLogger;
+    };
+    if ($@) {
+        print "<h2>HostGuard Pro - Module Load Error</h2><pre>" . _h($@) . "</pre>";
+        print "<p>Check that /usr/local/hostguard/lib/ contains HGConfig.pm and HGLogger.pm</p>";
+        return;
+    }
+
+    eval {
+        $config = HGConfig->loadconfig();
+        %conf = $config->config();
+        HGLogger->init(
+            file  => $conf{LOG_FILE} || '/var/log/hostguard/daemon.log',
+            level => $conf{LOG_LEVEL} || 1,
+        );
+    };
+    if ($@) {
+        $load_error = "Config load error: $@";
+    }
+
+    my $action   = $FORM{action}  || 'dashboard';
+    my $do       = $FORM{do}      || '';
+
+    # --- Rate limiting for POST actions ---
+    my $RATE_FILE = ($HGConfig::DATA_DIR || '/var/lib/hostguard') . '/whm_ratelimit';
+
+    # --- Process POST actions ---
+    my $message  = '';
+    my $msg_type = 'info';
+
+    if ($ENV{REQUEST_METHOD} && $ENV{REQUEST_METHOD} eq 'POST' && $do) {
+        if (!_check_rate_limit($RATE_FILE)) {
+            $message = "Rate limited. Please wait a few seconds between actions.";
+            $msg_type = 'warning';
+        } elsif ($load_error) {
+            $message = "Cannot perform actions: $load_error";
+            $msg_type = 'danger';
+        } else {
+            ($message, $msg_type) = _process_post_action($do, \%FORM, \%conf, \$action);
+            # Refresh config after actions
+            eval {
+                $config = HGConfig->loadconfig();
+                %conf = $config->config();
+            };
+        }
+    }
+
+    # --- Render page ---
+    _print_html_header();
+    _print_nav($action);
+
+    if ($load_error) {
+        print qq(<div class="alert alert-danger">) . _h($load_error) . qq(</div>\n);
+    }
+    if ($message) {
+        print qq(<div class="alert alert-$msg_type">) . _h($message) . qq(</div>\n);
+    }
+
+    # Route to page
+    if    ($action eq 'dashboard')      { _page_dashboard(\%conf, \%FORM); }
+    elsif ($action eq 'config')         { _page_config(\%conf); }
+    elsif ($action eq 'allowlist')      { _page_list('allow', \%conf); }
+    elsif ($action eq 'denylist')       { _page_list('deny', \%conf); }
+    elsif ($action eq 'ignorelist')     { _page_list('ignore', \%conf); }
+    elsif ($action eq 'tempblocks')     { _page_tempblocks(\%conf); }
+    elsif ($action eq 'services')       { _page_services(\%conf); }
+    elsif ($action eq 'logs')           { _page_logs(\%conf, \%FORM); }
+    elsif ($action eq 'search_results') { _page_search_results(\%FORM); }
+    else                                { _page_dashboard(\%conf, \%FORM); }
+
+    _print_html_footer();
+}
 
 ###############################################################################
 # POST Action Processor
 ###############################################################################
-sub process_post_action {
-    my ($post_action) = @_;
+sub _process_post_action {
+    my ($post_action, $FORM, $conf, $action_ref) = @_;
     my ($msg, $type) = ('', 'info');
 
     if ($post_action eq 'firewall_start') {
-        my $out = _run_cli('--enable');
+        _run_cli('-e');
         $msg  = "Firewall start command issued.";
         $type = 'success';
 
     } elsif ($post_action eq 'firewall_stop') {
-        my $out = _run_cli('--disable');
+        _run_cli('-x');
         $msg  = "Firewall stopped.";
         $type = 'success';
 
     } elsif ($post_action eq 'firewall_reload') {
-        my $out = _run_cli('--reload');
+        _run_cli('-r');
         $msg  = "Firewall rules reloaded.";
         $type = 'success';
 
     } elsif ($post_action eq 'daemon_start') {
-        system("/usr/local/hostguard/bin/hostguard --start-daemon >/dev/null 2>&1");
+        _run_cli('--start-daemon');
         $msg = "Daemon start command issued."; $type = 'success';
 
     } elsif ($post_action eq 'daemon_stop') {
-        system("/usr/local/hostguard/bin/hostguard --stop-daemon >/dev/null 2>&1");
+        _run_cli('--stop-daemon');
         $msg = "Daemon stop command issued."; $type = 'success';
 
     } elsif ($post_action eq 'daemon_restart') {
-        system("/usr/local/hostguard/bin/hostguard --stop-daemon >/dev/null 2>&1");
-        sleep(1);
-        system("/usr/local/hostguard/bin/hostguard --start-daemon >/dev/null 2>&1");
+        _run_cli('--restart-daemon');
         $msg = "Daemon restarted."; $type = 'success';
 
     } elsif ($post_action eq 'save_config') {
-        my $cfg_text = $FORM{config_text} || '';
-        if ($conf{RESTRICT_UI} && $conf{RESTRICT_UI} ne "0") {
-            $msg = "UI config changes are restricted (RESTRICT_UI=$conf{RESTRICT_UI}). Change via SSH.";
+        my $cfg_text = $FORM->{config_text} || '';
+        if ($conf->{RESTRICT_UI} && $conf->{RESTRICT_UI} ne "0") {
+            $msg = "UI config changes are restricted. Change via SSH.";
             $type = 'danger';
         } else {
             eval { _save_file("$HGConfig::CONFIG_DIR/hostguard.conf", $cfg_text); };
@@ -200,8 +203,8 @@ sub process_post_action {
         }
 
     } elsif ($post_action eq 'save_list') {
-        my $list_name = $FORM{list_name} || '';
-        my $list_text = $FORM{list_text} || '';
+        my $list_name = $FORM->{list_name} || '';
+        my $list_text = $FORM->{list_text} || '';
         if ($list_name =~ /^(allow|deny|ignore)$/) {
             eval { _save_file("$HGConfig::CONFIG_DIR/${list_name}.conf", $list_text); };
             $msg  = $@ ? "Error: $@" : ucfirst($list_name) . " list saved. Reload to apply.";
@@ -211,8 +214,8 @@ sub process_post_action {
         }
 
     } elsif ($post_action eq 'quick_allow') {
-        my $ip = _sanitize_ip($FORM{ip} || '');
-        my $comment = _sanitize_comment($FORM{comment} || 'WHM allow');
+        my $ip = _sanitize_ip($FORM->{ip} || '');
+        my $comment = _sanitize_comment($FORM->{comment} || 'WHM allow');
         if ($ip) {
             _run_cli('-a', $ip, $comment);
             $msg = "IP $ip added to allowlist."; $type = 'success';
@@ -221,8 +224,8 @@ sub process_post_action {
         }
 
     } elsif ($post_action eq 'quick_deny') {
-        my $ip = _sanitize_ip($FORM{ip} || '');
-        my $comment = _sanitize_comment($FORM{comment} || 'WHM deny');
+        my $ip = _sanitize_ip($FORM->{ip} || '');
+        my $comment = _sanitize_comment($FORM->{comment} || 'WHM deny');
         if ($ip) {
             _run_cli('-d', $ip, $comment);
             $msg = "IP $ip added to denylist."; $type = 'success';
@@ -231,7 +234,7 @@ sub process_post_action {
         }
 
     } elsif ($post_action eq 'unblock') {
-        my $ip = _sanitize_ip($FORM{ip} || '');
+        my $ip = _sanitize_ip($FORM->{ip} || '');
         if ($ip) {
             _run_cli('-tr', $ip);
             $msg = "Temporary block removed for $ip."; $type = 'success';
@@ -240,9 +243,9 @@ sub process_post_action {
         }
 
     } elsif ($post_action eq 'search_ip') {
-        my $ip = _sanitize_ip($FORM{ip} || '');
+        my $ip = _sanitize_ip($FORM->{ip} || '');
         if ($ip) {
-            $action = 'search_results';
+            $$action_ref = 'search_results';
         } else {
             $msg = "Invalid IP address."; $type = 'danger';
         }
@@ -251,7 +254,7 @@ sub process_post_action {
     return ($msg, $type);
 }
 
-# Run CLI command safely (no shell interpolation - list form exec)
+# Run CLI command safely (list-form exec, no shell interpolation)
 sub _run_cli {
     my @args = @_;
     my $cmd = '/usr/local/hostguard/bin/hostguard';
@@ -272,7 +275,8 @@ sub _run_cli {
 ###############################################################################
 # Page: Dashboard
 ###############################################################################
-sub page_dashboard {
+sub _page_dashboard {
+    my ($conf, $FORM) = @_;
     my $fw_status = _check_fw_status();
     my $daemon_pid = _get_daemon_pid();
     my $daemon_running = $daemon_pid && kill(0, $daemon_pid);
@@ -281,7 +285,7 @@ sub page_dashboard {
     my @deny   = _safe_load_iplist("$HGConfig::CONFIG_DIR/deny.conf");
     my @blocks = _load_tempblocks();
     my @active = grep { $_->{active} } @blocks;
-    my @recent_log = _tail_log(10);
+    my @recent_log = _tail_log($conf, 10);
 
     my $fw_html = $fw_status->{running}
         ? '<span class="status-on">ACTIVE</span>'
@@ -290,12 +294,12 @@ sub page_dashboard {
     my $dm_html = $daemon_running
         ? '<span class="status-on">RUNNING</span>'
         : '<span class="status-off">STOPPED</span>';
-    my $testing = ($conf{TESTING} || '0') eq '1'
+    my $testing = ($conf->{TESTING} || '0') eq '1'
         ? '<span class="status-warn">TESTING MODE</span>'
         : 'Disabled';
-    my $ipv6 = ($conf{IPV6} || '0') eq '1' ? 'Enabled' : 'Disabled';
-    my $ssh_thresh = $conf{LF_SSHD} || '5';
-    my $block_dur = _format_duration($conf{LF_TEMP_BLOCK_DURATION} || 3600);
+    my $ipv6 = ($conf->{IPV6} || '0') eq '1' ? 'Enabled' : 'Disabled';
+    my $ssh_thresh = $conf->{LF_SSHD} || '5';
+    my $block_dur = _format_duration($conf->{LF_TEMP_BLOCK_DURATION} || 3600);
     my $dm_pid_display = $daemon_running ? $daemon_pid : 'N/A';
     my $allow_count = scalar @allow;
     my $deny_count  = scalar @deny;
@@ -355,8 +359,8 @@ HTML
             last if ++$count > 10;
             my $exp = strftime("%Y-%m-%d %H:%M", localtime($b->{expires}));
             my $ttl = _format_duration($b->{ttl});
-            my $eip = html_escape($b->{ip});
-            my $erea = html_escape($b->{reason});
+            my $eip = _h($b->{ip});
+            my $erea = _h($b->{reason});
             print qq(<tr><td>$eip</td><td>$exp</td><td>$ttl</td><td>$erea</td>);
             print qq(<td><form method="post" style="display:inline"><input type="hidden" name="action" value="dashboard"><input type="hidden" name="ip" value="$eip"><button type="submit" name="do" value="unblock" class="btn btn-sm">Unblock</button></form></td></tr>\n);
         }
@@ -372,7 +376,7 @@ HTML
   <pre class="log-box">
 HTML
     for my $line (@recent_log) {
-        print html_escape($line) . "\n";
+        print _h($line) . "\n";
     }
     print "</pre>\n</div>\n";
 }
@@ -380,7 +384,8 @@ HTML
 ###############################################################################
 # Page: Config Editor
 ###############################################################################
-sub page_config {
+sub _page_config {
+    my ($conf) = @_;
     my $cfg_file = "$HGConfig::CONFIG_DIR/hostguard.conf";
     my $content = _read_file($cfg_file);
 
@@ -389,9 +394,9 @@ sub page_config {
         return;
     }
 
-    my $readonly = ($conf{RESTRICT_UI} && $conf{RESTRICT_UI} ne "0") ? 'readonly' : '';
+    my $readonly = ($conf->{RESTRICT_UI} && $conf->{RESTRICT_UI} ne "0") ? 'readonly' : '';
     my $disabled = $readonly ? 'disabled' : '';
-    my $escaped = html_escape($content);
+    my $escaped = _h($content);
 
     print <<HTML;
 <h2>Firewall Configuration</h2>
@@ -399,7 +404,7 @@ sub page_config {
   <p>Edit <code>/etc/hostguard/hostguard.conf</code>. After saving, reload the firewall to apply changes.</p>
 HTML
     if ($readonly) {
-        my $rval = html_escape($conf{RESTRICT_UI});
+        my $rval = _h($conf->{RESTRICT_UI});
         print qq(<p class="alert alert-warning">Config editing is restricted (RESTRICT_UI=$rval). Change this setting via SSH.</p>\n);
     }
     print <<HTML;
@@ -417,8 +422,8 @@ HTML
 ###############################################################################
 # Page: IP List Editor (allow/deny/ignore)
 ###############################################################################
-sub page_list {
-    my ($list_name) = @_;
+sub _page_list {
+    my ($list_name, $conf) = @_;
     my $file = "$HGConfig::CONFIG_DIR/${list_name}.conf";
     my $display_name = ucfirst($list_name) . "list";
 
@@ -427,7 +432,7 @@ sub page_list {
         print "<p class='alert alert-danger'>Cannot read $file</p>";
         return;
     }
-    my $escaped = html_escape($content);
+    my $escaped = _h($content);
     my $ucname = ucfirst($list_name);
 
     print <<HTML;
@@ -457,7 +462,8 @@ HTML
 ###############################################################################
 # Page: Temporary Blocks
 ###############################################################################
-sub page_tempblocks {
+sub _page_tempblocks {
+    my ($conf) = @_;
     my @blocks = _load_tempblocks();
     my @active = grep { $_->{active} } @blocks;
     my $active_count = scalar @active;
@@ -474,8 +480,8 @@ HTML
         for my $b (sort { $a->{expires} <=> $b->{expires} } @active) {
             my $exp = strftime("%Y-%m-%d %H:%M:%S", localtime($b->{expires}));
             my $ttl = _format_duration($b->{ttl});
-            my $eip = html_escape($b->{ip});
-            my $erea = html_escape($b->{reason});
+            my $eip = _h($b->{ip});
+            my $erea = _h($b->{reason});
             print <<HTML;
     <tr>
       <td>$eip</td><td>$exp</td><td>$ttl</td><td>$erea</td>
@@ -501,7 +507,8 @@ HTML
 ###############################################################################
 # Page: Service Controls
 ###############################################################################
-sub page_services {
+sub _page_services {
+    my ($conf) = @_;
     my $fw_status = _check_fw_status();
     my $daemon_pid = _get_daemon_pid();
     my $daemon_running = $daemon_pid && kill(0, $daemon_pid);
@@ -543,10 +550,11 @@ HTML
 ###############################################################################
 # Page: Log Viewer
 ###############################################################################
-sub page_logs {
-    my $lines = $FORM{lines} || 100;
+sub _page_logs {
+    my ($conf, $FORM) = @_;
+    my $lines = $FORM->{lines} || 100;
     $lines = 100 unless $lines =~ /^\d+$/ && $lines > 0 && $lines <= 1000;
-    my @log = _tail_log($lines);
+    my @log = _tail_log($conf, $lines);
 
     print <<HTML;
 <h2>Daemon Log</h2>
@@ -559,7 +567,7 @@ sub page_logs {
   <pre class="log-box" style="max-height:600px; overflow-y:auto;">
 HTML
     for my $line (@log) {
-        my $eline = html_escape($line);
+        my $eline = _h($line);
         if ($line =~ /\[ERROR\]/) {
             print qq(<span style="color:#dc3545">$eline</span>\n);
         } elsif ($line =~ /\[WARN\]/) {
@@ -574,16 +582,17 @@ HTML
 ###############################################################################
 # Page: Search Results
 ###############################################################################
-sub page_search_results {
-    my $ip = _sanitize_ip($FORM{ip} || '');
-    my $eip = html_escape($ip);
+sub _page_search_results {
+    my ($FORM) = @_;
+    my $ip = _sanitize_ip($FORM->{ip} || '');
+    my $eip = _h($ip);
     print "<h2>Search Results for $eip</h2>\n";
     print '<div class="card">';
 
     if ($ip) {
         my $output = _run_cli('-g', $ip);
         if ($output && $output !~ /No entries found/) {
-            print "<pre class='log-box'>" . html_escape($output) . "</pre>\n";
+            print "<pre class='log-box'>" . _h($output) . "</pre>\n";
         } else {
             print "<p>No entries found for $eip.</p>\n";
         }
@@ -596,13 +605,13 @@ sub page_search_results {
 ###############################################################################
 # HTML Template
 ###############################################################################
-sub print_html_header {
-    my $hostname = $ENV{SERVER_NAME} || $ENV{HOSTNAME} || '';
+sub _print_html_header {
+    my $hostname = $ENV{SERVER_NAME} || '';
     if (!$hostname) {
         eval { require Sys::Hostname; $hostname = Sys::Hostname::hostname(); };
         $hostname ||= 'server';
     }
-    my $ehostname = html_escape($hostname);
+    my $ehostname = _h($hostname);
 
     print qq(<!DOCTYPE html>\n<html lang="en">\n<head>\n);
     print qq(<meta charset="UTF-8">\n);
@@ -658,7 +667,7 @@ STYLE
     print qq(</head>\n<body>\n<div class="container">\n);
 }
 
-sub print_nav {
+sub _print_nav {
     my ($current) = @_;
     my $script = "hostguard.cgi";
 
@@ -689,7 +698,7 @@ sub print_nav {
     print qq(<div class="main">\n);
 }
 
-sub print_html_footer {
+sub _print_html_footer {
     print "</div>\n</div>\n</body>\n</html>\n";
 }
 
@@ -697,7 +706,8 @@ sub print_html_footer {
 # Utility Functions (zero external module dependencies for safety)
 ###############################################################################
 
-sub html_escape {
+# HTML escape - short name for convenience
+sub _h {
     my ($text) = @_;
     return '' unless defined $text;
     $text =~ s/&/&amp;/g;
@@ -797,9 +807,9 @@ sub _load_tempblocks {
 }
 
 sub _tail_log {
-    my ($num_lines) = @_;
+    my ($conf, $num_lines) = @_;
     $num_lines ||= 50;
-    my $logfile = $conf{LOG_FILE} || '/var/log/hostguard/daemon.log';
+    my $logfile = $conf->{LOG_FILE} || '/var/log/hostguard/daemon.log';
     return ("(log file not found: $logfile)") unless -f $logfile;
     open(my $fh, '<', $logfile) or return ("Cannot read log: $!");
     my @all = <$fh>;
@@ -822,6 +832,27 @@ sub _format_duration {
         return sprintf("%dm %ds", int($secs/60), $secs%60);
     }
     return "${secs}s";
+}
+
+sub _check_rate_limit {
+    my ($rate_file) = @_;
+    my $now = time();
+    my $window = 5;
+    if (-f $rate_file) {
+        if (open(my $fh, '<', $rate_file)) {
+            my $last = <$fh>;
+            close($fh);
+            chomp $last if $last;
+            if ($last && ($now - $last) < $window) {
+                return 0;
+            }
+        }
+    }
+    if (open(my $fh, '>', $rate_file)) {
+        print $fh $now;
+        close($fh);
+    }
+    return 1;
 }
 
 # Fallback form parser when Cpanel::Form is not available
