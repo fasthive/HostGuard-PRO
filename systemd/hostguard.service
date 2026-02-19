@@ -1,1 +1,13 @@
+[Unit]
+Description=HostGuard Pro Firewall
+After=network.target
+Before=hostguardd.service
 
+[Service]
+Type=oneshot
+ExecStart=/usr/local/hostguard/bin/hostguard --enable
+ExecStop=/usr/local/hostguard/bin/hostguard --disable
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
