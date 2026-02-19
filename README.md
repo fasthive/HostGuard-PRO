@@ -108,6 +108,16 @@ hostguard -l                # List temporary blocks
 
 ------------------------------------------------------------------------
 
+## 🔐 Security Architecture
+
+-   Strong validation for IP/CIDR/port inputs
+-   No unsafe shell execution
+-   Secure configuration file permissions
+-   Allowlist priority override
+-   Safe recovery mechanisms
+
+------------------------------------------------------------------------
+
 ## ⚙️ Installation
 
 ``` bash
@@ -137,17 +147,5 @@ Each installation must be activated with a valid license key. Unauthorized use, 
 For enterprise, volume, or custom licensing inquiries, please contact us directly through the website above.
 
 ------------------------------------------------------------------------
-
-## 🔐 Security Architecture
-
--   Strong validation for IP/CIDR/port inputs
--   No unsafe shell execution
--   Secure configuration file permissions
--   Allowlist priority override
--   Safe recovery mechanisms
-
-------------------------------------------------------------------------
-
-# HostGuard Pro
 
 Secure your infrastructure, React instantly.
