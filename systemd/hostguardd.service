@@ -1,1 +1,15 @@
+[Unit]
+Description=HostGuard Pro Login Failure Daemon
+After=network.target hostguard.service
 
+[Service]
+Type=forking
+PIDFile=/run/hostguardd.pid
+ExecStart=/usr/local/hostguard/bin/hostguardd
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
