@@ -42,7 +42,7 @@ HostGuard Pro continuously monitors your system and reacts within seconds blocki
 
 ### 🧠 Real-Time Login Protection
 
-HostGuard Pro includes a persistent background daemon (`hostguardd`) that:
+HostGuard Pro includes a persistent background daemon (`hostguard`) that:
 
 -   Monitors authentication logs continuously
 -   Detects brute-force behavior instantly
