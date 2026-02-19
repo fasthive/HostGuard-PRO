@@ -138,6 +138,4 @@ bash uninstall.sh
 
 # HostGuard Pro
 
-Secure your infrastructure.
-React instantly.
-Control everything from WHM.
+Secure your infrastructure, React instantly.
