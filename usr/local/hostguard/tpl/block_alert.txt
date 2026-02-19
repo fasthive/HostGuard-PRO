@@ -1,0 +1,21 @@
+HostGuard Pro - IP Blocked Alert
+==================================
+
+Server:   [HOSTNAME]
+Time:     [TIME]
+
+IP Address: [IP]
+Reason:     [REASON]
+Duration:   [DURATION] seconds
+
+This IP has been temporarily blocked by the HostGuard Pro login failure daemon,
+due to excessive authentication failures.
+
+If this is a false positive, you can unblock the IP with:
+  hostguard -tr [IP]
+
+Or add it to the permanent allowlist:
+  hostguard -a [IP] "Trusted IP"
+
+--
+HostGuard Pro
