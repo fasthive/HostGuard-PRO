@@ -29,9 +29,9 @@ sub init {
     return 1;
 }
 
-sub error { _log('ERROR', @_); }
-sub warn  { _log('WARN',  @_); }
-sub info  { _log('INFO',  @_); }
+sub error   { _log('ERROR', @_); }
+sub log_warn { _log('WARN',  @_); }
+sub info    { _log('INFO',  @_); }
 sub verbose { _log('VERBOSE', @_) if $LOG_LEVEL >= 2; }
 sub debug { _log('DEBUG', @_) if $LOG_LEVEL >= 3; }
 

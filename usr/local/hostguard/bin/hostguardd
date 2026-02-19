@@ -330,7 +330,7 @@ sub open_logs {
     }
 
     unless (keys %handles) {
-        HGLogger->warn("No log files found to monitor!");
+        HGLogger->log_warn("No log files found to monitor!");
     }
 
     return %handles;
@@ -341,7 +341,7 @@ sub _open_log_file {
     my %lh = (file => $file, fh => undef, inode => 0);
 
     open(my $fh, '<', $file) or do {
-        HGLogger->warn("Cannot open log file: $file: $!");
+        HGLogger->log_warn("Cannot open log file: $file: $!");
         return \%lh;
     };
 
@@ -421,7 +421,7 @@ sub send_alert {
 
     # Use sendmail
     open(my $mail, '|-', '/usr/sbin/sendmail', '-t') or do {
-        HGLogger->warn("Cannot send alert email: $!");
+        HGLogger->log_warn("Cannot send alert email: $!");
         return;
     };
     print $mail "From: $from\n";

@@ -9,6 +9,7 @@ package HGFirewall;
 ###############################################################################
 use strict;
 use warnings;
+use Fcntl qw(:flock);
 use HGConfig;
 use HGLogger;
 
@@ -51,7 +52,8 @@ sub init {
     $IPV6      = $config->get('IPV6') // 0;
 
     unless ($IPTABLES && -x $IPTABLES) {
-        die "FATAL: iptables not found. Cannot start firewall.\n";
+        HGLogger->error("FATAL: iptables not found. Cannot start firewall.");
+        return 0;
     }
 
     HGLogger->info("Firewall engine initialized: iptables=$IPTABLES ipset=" .
@@ -974,7 +976,5 @@ sub _write_file {
     print $fh $content;
     close($fh);
 }
-
-use Fcntl qw(:flock);
 
 1;
