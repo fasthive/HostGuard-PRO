@@ -1,0 +1,486 @@
+#!/usr/bin/perl
+###############################################################################
+# HostGuard Pro - Login Failure Daemon (hostguardd)
+# /usr/local/hostguard/bin/hostguardd
+#
+# Long-running daemon that continuously monitors authentication logs for
+# brute-force login failures and blocks offending IPs.
+#
+# Supports: sshd, dovecot (POP3/IMAP), exim (SMTP AUTH), cPanel/WHM,
+#           pure-ftpd, proftpd
+#
+# Uses inode tracking to survive log rotation gracefully.
+###############################################################################
+use strict;
+use warnings;
+use POSIX qw(strftime setsid);
+use Fcntl qw(:DEFAULT :flock);
+use File::Basename;
+
+# Add our lib path
+use lib '/usr/local/hostguard/lib';
+use HGConfig;
+use HGFirewall;
+use HGLogger;
+
+# Globals
+my $PIDFILE    = "/run/hostguardd.pid";
+my $DATA_DIR   = $HGConfig::DATA_DIR;
+my $CONFIG_DIR = $HGConfig::CONFIG_DIR;
+my $RUNNING    = 1;
+my $RELOAD     = 0;
+my %config;
+my %counters;       # IP => { service => count, first_seen => time, total => count }
+my %block_history;  # IP => number of times temp-blocked (for promotion tracking)
+
+###############################################################################
+# Signal handlers
+###############################################################################
+$SIG{TERM} = $SIG{INT} = sub { $RUNNING = 0; };
+$SIG{HUP}  = sub { $RELOAD = 1; };
+$SIG{USR1} = sub { dump_state(); };
+
+###############################################################################
+# Regex patterns for log parsing
+###############################################################################
+my %PATTERNS = (
+    sshd => [
+        # Failed password for user from IP
+        qr/sshd\[\d+\]:\s+Failed password for (?:invalid user )?\S+ from (\d+\.\d+\.\d+\.\d+)/,
+        # Invalid user from IP
+        qr/sshd\[\d+\]:\s+Invalid user \S+ from (\d+\.\d+\.\d+\.\d+)/,
+        # Connection closed by authenticating user
+        qr/sshd\[\d+\]:\s+Connection closed by authenticating user \S+ (\d+\.\d+\.\d+\.\d+)/,
+        # PAM auth failure
+        qr/sshd\[\d+\]:\s+pam_unix\(sshd:auth\):\s+authentication failure.*rhost=(\d+\.\d+\.\d+\.\d+)/,
+    ],
+    ftpd => [
+        # pure-ftpd
+        qr/pure-ftpd.*\[WARNING\] Authentication failed for user .* \[(\d+\.\d+\.\d+\.\d+)\]/,
+        # proftpd
+        qr/proftpd\[\d+\].*no such user.*\[(\d+\.\d+\.\d+\.\d+)\]/i,
+        qr/proftpd\[\d+\].*Login failed.*?(\d+\.\d+\.\d+\.\d+)/i,
+    ],
+    pop3d => [
+        # dovecot POP3
+        qr/dovecot.*pop3-login.*Authentication failure.*rip=(\d+\.\d+\.\d+\.\d+)/,
+        qr/dovecot.*pop3-login.*Aborted login.*rip=(\d+\.\d+\.\d+\.\d+)/,
+        qr/dovecot.*pop3-login.*Disconnected.*auth failed.*rip=(\d+\.\d+\.\d+\.\d+)/i,
+    ],
+    imapd => [
+        # dovecot IMAP
+        qr/dovecot.*imap-login.*Authentication failure.*rip=(\d+\.\d+\.\d+\.\d+)/,
+        qr/dovecot.*imap-login.*Aborted login.*rip=(\d+\.\d+\.\d+\.\d+)/,
+        qr/dovecot.*imap-login.*Disconnected.*auth failed.*rip=(\d+\.\d+\.\d+\.\d+)/i,
+    ],
+    smtpauth => [
+        # exim SMTP AUTH failures
+        qr/exim.*authenticator failed.*H=.*\[(\d+\.\d+\.\d+\.\d+)\]/,
+        qr/exim.*rejected RCPT.*\[(\d+\.\d+\.\d+\.\d+)\]/,
+        qr/exim.*login authenticator failed for.*\[(\d+\.\d+\.\d+\.\d+)\]/,
+    ],
+    cpanel => [
+        # cPanel/WHM login failures
+        qr/FAILED LOGIN.*ip=(\d+\.\d+\.\d+\.\d+)/,
+        qr/Login attempt failed.*from (\d+\.\d+\.\d+\.\d+)/i,
+        qr/brute force.*from (\d+\.\d+\.\d+\.\d+)/i,
+    ],
+);
+
+# Map service names to config threshold keys
+my %SERVICE_THRESHOLD = (
+    sshd     => 'LF_SSHD',
+    ftpd     => 'LF_FTPD',
+    pop3d    => 'LF_POP3D',
+    imapd    => 'LF_IMAPD',
+    smtpauth => 'LF_SMTPAUTH',
+    cpanel   => 'LF_CPANEL',
+);
+
+###############################################################################
+# Main
+###############################################################################
+
+sub main {
+    # Load config
+    my $cfg = HGConfig->loadconfig();
+    %config = $cfg->config();
+
+    # Check if testing mode prevents daemon start
+    if (($config{TESTING} // 0) eq "1") {
+        print STDERR "HostGuard Pro daemon cannot start while TESTING=1. Set TESTING=0 first.\n";
+        exit(1);
+    }
+
+    # Check if daemon is enabled
+    unless (($config{LF_DAEMON} // 1) eq "1") {
+        print STDERR "Login failure daemon is disabled (LF_DAEMON=0).\n";
+        exit(0);
+    }
+
+    # Initialize logger
+    HGLogger->init(
+        file  => $config{LOG_FILE} // "/var/log/hostguard/daemon.log",
+        level => $config{LOG_LEVEL} // 1,
+    );
+
+    # Initialize firewall module
+    HGFirewall->init($cfg);
+
+    # Daemonize unless -f (foreground) flag
+    my $foreground = 0;
+    for my $arg (@ARGV) {
+        $foreground = 1 if $arg eq '-f' || $arg eq '--foreground';
+    }
+
+    unless ($foreground) {
+        daemonize();
+    }
+
+    # Write PID file
+    write_pidfile();
+
+    # Load block history
+    load_block_history();
+
+    HGLogger->info("HostGuard Pro daemon started (PID $$)");
+
+    # Open log files for tailing
+    my %log_handles = open_logs();
+
+    # Main loop
+    while ($RUNNING) {
+        if ($RELOAD) {
+            HGLogger->info("Reloading configuration...");
+            $cfg = HGConfig->loadconfig();
+            %config = $cfg->config();
+            HGFirewall->init($cfg);
+            %log_handles = open_logs();
+            $RELOAD = 0;
+            HGLogger->info("Configuration reloaded.");
+        }
+
+        # Read new lines from each log
+        for my $logname (keys %log_handles) {
+            my $lh = $log_handles{$logname};
+            next unless $lh->{fh};
+
+            # Check for log rotation (inode change)
+            my @stat = stat($lh->{file});
+            if (@stat && $stat[1] != $lh->{inode}) {
+                HGLogger->info("Log rotation detected for $lh->{file}, reopening...");
+                close($lh->{fh});
+                $lh = _open_log_file($lh->{file});
+                $log_handles{$logname} = $lh;
+                next unless $lh->{fh};
+            }
+
+            # Read new lines
+            my $fh = $lh->{fh};
+            while (my $line = <$fh>) {
+                chomp $line;
+                process_line($line);
+            }
+            # Reset EOF
+            seek($fh, 0, 1);
+        }
+
+        # Expire old counters
+        expire_counters();
+
+        # Clean up expired temp blocks periodically (every 60 iterations ~ every ~3 minutes)
+        state $cleanup_counter = 0;
+        if (++$cleanup_counter >= 60) {
+            HGFirewall->cleanup_expired();
+            $cleanup_counter = 0;
+        }
+
+        # Sleep for parse interval
+        my $interval = $config{LF_PARSE_INTERVAL} // 3;
+        sleep($interval);
+    }
+
+    # Cleanup
+    HGLogger->info("HostGuard Pro daemon shutting down (PID $$)");
+    unlink($PIDFILE);
+    save_block_history();
+}
+
+###############################################################################
+# Log processing
+###############################################################################
+
+sub process_line {
+    my ($line) = @_;
+
+    for my $service (keys %PATTERNS) {
+        my $threshold_key = $SERVICE_THRESHOLD{$service};
+        my $threshold = $config{$threshold_key} // 0;
+        next unless $threshold > 0;
+
+        for my $re (@{$PATTERNS{$service}}) {
+            if ($line =~ $re) {
+                my $ip = $1;
+                next unless HGConfig->valid_ipv4($ip);
+
+                record_failure($ip, $service);
+                last;
+            }
+        }
+    }
+}
+
+sub record_failure {
+    my ($ip, $service) = @_;
+
+    # Initialize counter for this IP if needed
+    $counters{$ip} //= { first_seen => time(), total => 0 };
+    $counters{$ip}{$service} = ($counters{$ip}{$service} // 0) + 1;
+    $counters{$ip}{total}++;
+
+    HGLogger->verbose("Login failure: IP=$ip service=$service count=$counters{$ip}{$service} total=$counters{$ip}{total}");
+
+    # Check per-service threshold
+    my $threshold_key = $SERVICE_THRESHOLD{$service};
+    my $threshold     = $config{$threshold_key} // 0;
+
+    if ($threshold > 0 && $counters{$ip}{$service} >= $threshold) {
+        block_ip($ip, "$service login failures ($counters{$ip}{$service} in window)");
+        delete $counters{$ip};
+        return;
+    }
+
+    # Check global/cross-protocol threshold
+    if (($config{LF_GLOBAL_THRESHOLD} // 0) eq "1") {
+        my $global_limit = $config{LF_GLOBAL_LIMIT} // 15;
+        if ($counters{$ip}{total} >= $global_limit) {
+            block_ip($ip, "Cross-protocol failures ($counters{$ip}{total} total)");
+            delete $counters{$ip};
+            return;
+        }
+    }
+}
+
+sub block_ip {
+    my ($ip, $reason) = @_;
+
+    HGLogger->info("Blocking IP $ip - $reason");
+
+    my $duration = $config{LF_TEMP_BLOCK_DURATION} // 3600;
+
+    # Check if this IP should be promoted to permanent
+    $block_history{$ip} = ($block_history{$ip} // 0) + 1;
+    my $perm_after = $config{LF_PERM_BLOCK_AFTER} // 3;
+
+    if ($perm_after > 0 && $block_history{$ip} >= $perm_after) {
+        HGLogger->info("Promoting $ip to permanent block (blocked $block_history{$ip} times)");
+        HGFirewall->permblock($ip, "Auto-promoted: $reason (blocked $block_history{$ip} times)");
+        save_block_history();
+        return;
+    }
+
+    HGFirewall->tempblock($ip, $duration, $reason);
+    save_block_history();
+
+    # Send email alert if configured
+    if (($config{LF_EMAIL_ALERT} // 0) eq "1") {
+        send_alert($ip, $reason, $duration);
+    }
+}
+
+sub expire_counters {
+    my $now      = time();
+    my $interval = $config{LF_INTERVAL} // 3600;
+
+    for my $ip (keys %counters) {
+        if ($now - $counters{$ip}{first_seen} > $interval) {
+            HGLogger->debug("Expiring counter for $ip");
+            delete $counters{$ip};
+        }
+    }
+}
+
+###############################################################################
+# Log file management
+###############################################################################
+
+sub open_logs {
+    my %handles;
+
+    # Map config keys to log files
+    my @log_configs = (
+        ['sshd',     $config{LOG_SSHD}],
+        ['sshd_alt', $config{LOG_SSHD_ALT}],
+        ['ftpd',     $config{LOG_FTPD}],
+        ['mail',     $config{LOG_MAIL}],
+        ['mail_alt', $config{LOG_MAIL_ALT}],
+        ['cpanel',   $config{LOG_CPANEL}],
+        ['cpanel_err', $config{LOG_CPANEL_ERROR}],
+    );
+
+    for my $lc (@log_configs) {
+        my ($name, $file) = @$lc;
+        next unless $file && -f $file;
+
+        my $lh = _open_log_file($file);
+        if ($lh->{fh}) {
+            $handles{$name} = $lh;
+            HGLogger->info("Monitoring log: $file");
+        }
+    }
+
+    unless (keys %handles) {
+        HGLogger->warn("No log files found to monitor!");
+    }
+
+    return %handles;
+}
+
+sub _open_log_file {
+    my ($file) = @_;
+    my %lh = (file => $file, fh => undef, inode => 0);
+
+    open(my $fh, '<', $file) or do {
+        HGLogger->warn("Cannot open log file: $file: $!");
+        return \%lh;
+    };
+
+    # Seek to end (we only want new lines)
+    seek($fh, 0, 2);
+
+    my @stat = stat($file);
+    $lh{fh}    = $fh;
+    $lh{inode} = $stat[1] // 0;
+
+    return \%lh;
+}
+
+###############################################################################
+# Block history persistence
+###############################################################################
+
+sub load_block_history {
+    my $file = "$DATA_DIR/block_history.dat";
+    return unless -f $file;
+
+    open(my $fh, '<', $file) or return;
+    while (my $line = <$fh>) {
+        chomp $line;
+        my ($ip, $count) = split(/\|/, $line, 2);
+        $block_history{$ip} = $count if $ip && $count;
+    }
+    close($fh);
+}
+
+sub save_block_history {
+    my $file = "$DATA_DIR/block_history.dat";
+    open(my $fh, '>', $file) or return;
+    flock($fh, LOCK_EX);
+    for my $ip (keys %block_history) {
+        print $fh "$ip|$block_history{$ip}\n";
+    }
+    close($fh);
+}
+
+###############################################################################
+# Email alerts
+###############################################################################
+
+sub send_alert {
+    my ($ip, $reason, $duration) = @_;
+
+    my $to   = $config{LF_ALERT_TO}   // 'root';
+    my $from = $config{LF_ALERT_FROM} // 'hostguard@localhost';
+
+    my $hostname = `hostname 2>/dev/null`;
+    chomp $hostname;
+    $hostname ||= 'server';
+
+    my $template = "/usr/local/hostguard/tpl/block_alert.txt";
+    my $body;
+
+    if (-f $template) {
+        open(my $fh, '<', $template) or return;
+        $body = do { local $/; <$fh> };
+        close($fh);
+
+        # Template substitution
+        $body =~ s/\[IP\]/$ip/g;
+        $body =~ s/\[REASON\]/$reason/g;
+        $body =~ s/\[DURATION\]/$duration/g;
+        $body =~ s/\[HOSTNAME\]/$hostname/g;
+        $body =~ s/\[TIME\]/localtime()/ge;
+    } else {
+        $body = "HostGuard Pro Alert\n\n"
+              . "Hostname: $hostname\n"
+              . "Time: " . localtime() . "\n"
+              . "IP Blocked: $ip\n"
+              . "Reason: $reason\n"
+              . "Duration: ${duration}s\n";
+    }
+
+    # Use sendmail
+    open(my $mail, '|-', '/usr/sbin/sendmail', '-t') or do {
+        HGLogger->warn("Cannot send alert email: $!");
+        return;
+    };
+    print $mail "From: $from\n";
+    print $mail "To: $to\n";
+    print $mail "Subject: HostGuard Pro [$hostname] IP Blocked: $ip\n";
+    print $mail "Content-Type: text/plain; charset=UTF-8\n";
+    print $mail "\n";
+    print $mail $body;
+    close($mail);
+
+    HGLogger->info("Alert email sent to $to for $ip");
+}
+
+###############################################################################
+# Daemonize
+###############################################################################
+
+sub daemonize {
+    # Fork and detach
+    defined(my $pid = fork()) or die "Cannot fork: $!\n";
+    exit(0) if $pid;
+
+    setsid() or die "Cannot setsid: $!\n";
+
+    # Fork again to prevent acquiring a controlling terminal
+    defined($pid = fork()) or die "Cannot fork: $!\n";
+    exit(0) if $pid;
+
+    # Redirect stdio
+    open(STDIN,  '<', '/dev/null') or die "Cannot redirect STDIN: $!\n";
+    open(STDOUT, '>>', $config{LOG_FILE} // '/var/log/hostguard/daemon.log') or die "Cannot redirect STDOUT: $!\n";
+    open(STDERR, '>>&', \*STDOUT) or die "Cannot redirect STDERR: $!\n";
+
+    chdir('/');
+    umask(0027);
+}
+
+sub write_pidfile {
+    open(my $fh, '>', $PIDFILE) or die "Cannot write PID file $PIDFILE: $!\n";
+    print $fh "$$\n";
+    close($fh);
+}
+
+###############################################################################
+# Debug state dump (on SIGUSR1)
+###############################################################################
+
+sub dump_state {
+    HGLogger->info("=== STATE DUMP ===");
+    HGLogger->info("Active IP counters: " . scalar(keys %counters));
+    for my $ip (sort keys %counters) {
+        my $c = $counters{$ip};
+        HGLogger->info("  $ip: total=$c->{total} age=" . (time() - $c->{first_seen}) . "s");
+    }
+    HGLogger->info("Block history entries: " . scalar(keys %block_history));
+    HGLogger->info("=== END STATE DUMP ===");
+}
+
+###############################################################################
+# Run
+###############################################################################
+main();
