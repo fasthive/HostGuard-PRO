@@ -111,7 +111,7 @@ hostguard -l                # List temporary blocks
 ## ⚙️ Installation
 
 ``` bash
-git clone https://github.com/fasthive/hostguard-pro.git
+git clone https://github.com/fasthive/HostGuard-PRO.git
 cd hostguard-pro
 bash install.sh
 ```
@@ -123,6 +123,18 @@ bash install.sh
 ``` bash
 bash uninstall.sh
 ```
+
+------------------------------------------------------------------------
+
+## 🔐 Licensing
+
+HostGuard Pro is a commercial software, and a valid license is required for production use. 
+
+Licenses can be purchased at:👉 **https://fasthive.com/hostguard-pro**
+
+Each installation must be activated with a valid license key. Unauthorized use, redistribution, modification, or deployment without a properly issued license is strictly prohibited.
+
+For enterprise, volume, or custom licensing inquiries, please contact us directly through the website above.
 
 ------------------------------------------------------------------------
 
