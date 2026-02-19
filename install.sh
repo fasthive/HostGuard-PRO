@@ -4,7 +4,7 @@
 # Run as root on a cPanel/WHM server (AlmaLinux/Rocky/CentOS)
 ###############################################################################
 set -e
-ss
+
 VERSION="1.0.0"
 INSTALL_DIR="$(cd "$(dirname "$0")" && pwd)"
 
