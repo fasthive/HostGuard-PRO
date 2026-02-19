@@ -1,0 +1,401 @@
+#!/usr/bin/perl
+###############################################################################
+# HostGuard Pro - CLI Tool
+# /usr/local/hostguard/bin/hostguard
+#
+# Command-line interface for managing the HostGuard Pro firewall and daemon.
+#
+# Usage:
+#   hostguard -e              Enable firewall
+#   hostguard -x              Disable firewall
+#   hostguard -r              Reload firewall rules
+#   hostguard -a <ip> [note]  Allow IP
+#   hostguard -d <ip> [note]  Deny/block IP
+#   hostguard -tr <ip>        Remove temporary block
+#   hostguard -g <ip>         Search/grep IP in rules and lists
+#   hostguard -l              List temporary blocks
+#   hostguard -s              Show firewall status
+#   hostguard -v              Show version
+#   hostguard --start-daemon  Start the login failure daemon
+#   hostguard --stop-daemon   Stop the login failure daemon
+###############################################################################
+use strict;
+use warnings;
+
+use lib '/usr/local/hostguard/lib';
+use HGConfig;
+use HGFirewall;
+use HGLogger;
+
+my $VERSION = $HGConfig::VERSION;
+
+# Must run as root
+unless ($> == 0) {
+    die "Error: hostguard must be run as root.\n";
+}
+
+# Parse arguments
+my $action = shift @ARGV // '';
+my $arg1   = shift @ARGV // '';
+my $arg2   = join(' ', @ARGV);
+
+# Initialize logger
+my $config = HGConfig->loadconfig();
+HGLogger->init(
+    file  => $config->get('LOG_FILE') // '/var/log/hostguard/daemon.log',
+    level => $config->get('LOG_LEVEL') // 1,
+);
+
+# Route to action
+if ($action eq '-e' || $action eq '--enable') {
+    cmd_enable();
+} elsif ($action eq '-x' || $action eq '--disable') {
+    cmd_disable();
+} elsif ($action eq '-r' || $action eq '--reload' || $action eq '--restart') {
+    cmd_reload();
+} elsif ($action eq '-a' || $action eq '--allow') {
+    cmd_allow($arg1, $arg2);
+} elsif ($action eq '-d' || $action eq '--deny') {
+    cmd_deny($arg1, $arg2);
+} elsif ($action eq '-tr' || $action eq '--temp-remove' || $action eq '--unblock') {
+    cmd_tempremove($arg1);
+} elsif ($action eq '-g' || $action eq '--grep') {
+    cmd_grep($arg1);
+} elsif ($action eq '-l' || $action eq '--list') {
+    cmd_list();
+} elsif ($action eq '-s' || $action eq '--status') {
+    cmd_status();
+} elsif ($action eq '-v' || $action eq '--version') {
+    print "HostGuard Pro v$VERSION\n";
+} elsif ($action eq '--start-daemon') {
+    cmd_start_daemon();
+} elsif ($action eq '--stop-daemon') {
+    cmd_stop_daemon();
+} elsif ($action eq '--restart-daemon') {
+    cmd_stop_daemon();
+    sleep(1);
+    cmd_start_daemon();
+} elsif ($action eq '-h' || $action eq '--help' || $action eq '') {
+    show_help();
+} else {
+    print "Unknown command: $action\n";
+    show_help();
+    exit(1);
+}
+
+###############################################################################
+# Commands
+###############################################################################
+
+sub cmd_enable {
+    print "Enabling HostGuard Pro firewall...\n";
+    HGFirewall->init($config);
+    eval { HGFirewall->start($config); };
+    if ($@) {
+        print "ERROR: $@\n";
+        exit(1);
+    }
+    print "Firewall enabled.\n";
+
+    # Handle testing mode cron
+    if (($config->get('TESTING') // 0) eq "1") {
+        install_testing_cron();
+        my $interval = $config->get('TESTING_INTERVAL') // 5;
+        print "WARNING: TESTING mode is enabled. Firewall will auto-clear in $interval minutes.\n";
+        print "Set TESTING=0 in hostguard.conf and reload when ready.\n";
+    }
+}
+
+sub cmd_disable {
+    print "Disabling HostGuard Pro firewall...\n";
+    HGFirewall->init($config);
+    eval { HGFirewall->stop(); };
+    if ($@) {
+        print "ERROR: $@\n";
+        exit(1);
+    }
+    remove_testing_cron();
+    print "Firewall disabled. All rules flushed.\n";
+}
+
+sub cmd_reload {
+    print "Reloading HostGuard Pro firewall rules...\n";
+    # Re-read config
+    $config = HGConfig->loadconfig();
+    HGFirewall->init($config);
+    eval { HGFirewall->reload($config); };
+    if ($@) {
+        print "ERROR: $@\n";
+        exit(1);
+    }
+    print "Firewall rules reloaded.\n";
+
+    # Signal daemon to reload if running
+    my $pid = get_daemon_pid();
+    if ($pid) {
+        kill('HUP', $pid);
+        print "Daemon signaled to reload configuration.\n";
+    }
+}
+
+sub cmd_allow {
+    my ($ip, $comment) = @_;
+    unless ($ip) {
+        print "Usage: hostguard -a <ip> [comment]\n";
+        exit(1);
+    }
+    unless (HGConfig->valid_ip($ip)) {
+        print "Error: Invalid IP address: $ip\n";
+        exit(1);
+    }
+
+    $comment ||= "CLI allow";
+    HGFirewall->init($config);
+    HGFirewall->allow($ip, $comment);
+    print "IP $ip added to allowlist.\n";
+}
+
+sub cmd_deny {
+    my ($ip, $comment) = @_;
+    unless ($ip) {
+        print "Usage: hostguard -d <ip> [comment]\n";
+        exit(1);
+    }
+    unless (HGConfig->valid_ip($ip)) {
+        print "Error: Invalid IP address: $ip\n";
+        exit(1);
+    }
+
+    $comment ||= "CLI deny";
+    HGFirewall->init($config);
+    HGFirewall->permblock($ip, $comment);
+    print "IP $ip added to denylist.\n";
+}
+
+sub cmd_tempremove {
+    my ($ip) = @_;
+    unless ($ip) {
+        print "Usage: hostguard -tr <ip>\n";
+        exit(1);
+    }
+    unless (HGConfig->valid_ip($ip)) {
+        print "Error: Invalid IP address: $ip\n";
+        exit(1);
+    }
+
+    HGFirewall->init($config);
+    HGFirewall->tempunblock($ip);
+    print "Temporary block removed for $ip.\n";
+}
+
+sub cmd_grep {
+    my ($ip) = @_;
+    unless ($ip) {
+        print "Usage: hostguard -g <ip>\n";
+        exit(1);
+    }
+    unless (HGConfig->valid_ip($ip)) {
+        print "Error: Invalid IP address: $ip\n";
+        exit(1);
+    }
+
+    HGFirewall->init($config);
+    my @results = HGFirewall->grep_ip($ip);
+    if (@results) {
+        print "Results for $ip:\n";
+        for my $r (@results) {
+            print "  $r\n";
+        }
+    } else {
+        print "No entries found for $ip.\n";
+    }
+}
+
+sub cmd_list {
+    my @blocks = HGFirewall->list_tempblocks();
+    my @active = grep { $_->{active} } @blocks;
+
+    if (@active) {
+        printf("%-18s %-12s %-8s %s\n", "IP Address", "Expires", "TTL", "Reason");
+        printf("%-18s %-12s %-8s %s\n", "-" x 16, "-" x 10, "-" x 6, "-" x 30);
+        for my $b (sort { $a->{expires} <=> $b->{expires} } @active) {
+            my $exp_str = strftime_safe($b->{expires});
+            my $ttl_str = format_duration($b->{ttl});
+            printf("%-18s %-12s %-8s %s\n", $b->{ip}, $exp_str, $ttl_str, $b->{reason});
+        }
+        print "\nTotal active temporary blocks: " . scalar(@active) . "\n";
+    } else {
+        print "No active temporary blocks.\n";
+    }
+}
+
+sub cmd_status {
+    HGFirewall->init($config);
+    my $st = HGFirewall->status();
+    my $daemon_pid = get_daemon_pid();
+
+    print "HostGuard Pro v$VERSION\n";
+    print "=" x 50 . "\n";
+
+    if ($st->{running}) {
+        my $since = $st->{since} ? scalar(localtime($st->{since})) : "unknown";
+        print "Firewall:  ACTIVE (since $since)\n";
+    } else {
+        print "Firewall:  INACTIVE\n";
+    }
+
+    if ($daemon_pid && kill(0, $daemon_pid)) {
+        print "Daemon:    RUNNING (PID $daemon_pid)\n";
+    } else {
+        print "Daemon:    STOPPED\n";
+    }
+
+    print "Testing:   " . ($config->get('TESTING') eq "1" ? "ENABLED" : "disabled") . "\n";
+    print "IPv6:      " . ($config->get('IPV6') eq "1" ? "enabled" : "disabled") . "\n";
+    print "ipset:     " . ($config->get('LF_IPSET') eq "1" ? "enabled" : "disabled") . "\n";
+
+    # Count entries
+    my @allow  = HGConfig->load_iplist("$HGConfig::CONFIG_DIR/allow.conf");
+    my @deny   = HGConfig->load_iplist("$HGConfig::CONFIG_DIR/deny.conf");
+    my @blocks = HGFirewall->list_tempblocks();
+    my @active = grep { $_->{active} } @blocks;
+
+    print "\nAllowlist: " . scalar(@allow) . " entries\n";
+    print "Denylist:  " . scalar(@deny) . " entries\n";
+    print "Temp blocks: " . scalar(@active) . " active\n";
+
+    print "\nPorts:\n";
+    print "  TCP_IN:  " . ($config->get('TCP_IN') // 'none') . "\n";
+    print "  TCP_OUT: " . ($config->get('TCP_OUT') // 'none') . "\n";
+    print "  UDP_IN:  " . ($config->get('UDP_IN') // 'none') . "\n";
+    print "  UDP_OUT: " . ($config->get('UDP_OUT') // 'none') . "\n";
+}
+
+sub cmd_start_daemon {
+    my $pid = get_daemon_pid();
+    if ($pid && kill(0, $pid)) {
+        print "Daemon already running (PID $pid).\n";
+        return;
+    }
+    print "Starting HostGuard Pro daemon...\n";
+    system("/usr/local/hostguard/bin/hostguardd");
+    sleep(1);
+    $pid = get_daemon_pid();
+    if ($pid && kill(0, $pid)) {
+        print "Daemon started (PID $pid).\n";
+    } else {
+        print "Warning: Daemon may not have started. Check logs.\n";
+    }
+}
+
+sub cmd_stop_daemon {
+    my $pid = get_daemon_pid();
+    unless ($pid && kill(0, $pid)) {
+        print "Daemon is not running.\n";
+        return;
+    }
+    print "Stopping HostGuard Pro daemon (PID $pid)...\n";
+    kill('TERM', $pid);
+    # Wait up to 10 seconds
+    for (1..10) {
+        last unless kill(0, $pid);
+        sleep(1);
+    }
+    if (kill(0, $pid)) {
+        kill('KILL', $pid);
+        sleep(1);
+    }
+    unlink("/run/hostguardd.pid");
+    print "Daemon stopped.\n";
+}
+
+###############################################################################
+# Testing mode cron management
+###############################################################################
+
+sub install_testing_cron {
+    my $interval = $config->get('TESTING_INTERVAL') // 5;
+    my $cron_content = "*/$interval * * * * root /usr/local/hostguard/bin/hostguard -x > /dev/null 2>&1\n";
+
+    open(my $fh, '>', '/etc/cron.d/hostguard_testing') or do {
+        print "Warning: Cannot create testing cron: $!\n";
+        return;
+    };
+    print $fh "# HostGuard Pro TESTING mode - auto-disable firewall\n";
+    print $fh $cron_content;
+    close($fh);
+    chmod(0644, '/etc/cron.d/hostguard_testing');
+}
+
+sub remove_testing_cron {
+    unlink('/etc/cron.d/hostguard_testing');
+}
+
+###############################################################################
+# Helpers
+###############################################################################
+
+sub get_daemon_pid {
+    my $pidfile = "/run/hostguardd.pid";
+    return 0 unless -f $pidfile;
+    open(my $fh, '<', $pidfile) or return 0;
+    my $pid = <$fh>;
+    close($fh);
+    chomp $pid if $pid;
+    return $pid && $pid =~ /^\d+$/ ? $pid : 0;
+}
+
+sub strftime_safe {
+    my ($ts) = @_;
+    return "N/A" unless $ts;
+    return POSIX::strftime("%H:%M:%S", localtime($ts));
+}
+
+sub format_duration {
+    my ($secs) = @_;
+    return "0s" unless $secs;
+    if ($secs >= 86400) {
+        return sprintf("%dd%dh", int($secs/86400), int(($secs%86400)/3600));
+    } elsif ($secs >= 3600) {
+        return sprintf("%dh%dm", int($secs/3600), int(($secs%3600)/60));
+    } elsif ($secs >= 60) {
+        return sprintf("%dm%ds", int($secs/60), $secs%60);
+    }
+    return "${secs}s";
+}
+
+sub show_help {
+    print <<EOF;
+HostGuard Pro v$VERSION - Firewall & Login Protection
+
+Usage: hostguard [option] [arguments]
+
+Firewall:
+  -e, --enable            Enable and start the firewall
+  -x, --disable           Disable the firewall (flush all rules)
+  -r, --reload            Reload firewall rules from config
+  -s, --status            Show firewall and daemon status
+
+IP Management:
+  -a, --allow <ip> [note] Add IP to allowlist
+  -d, --deny  <ip> [note] Add IP to permanent denylist
+  -tr, --unblock <ip>     Remove a temporary block
+  -g, --grep <ip>         Search for IP in all lists and rules
+  -l, --list              List active temporary blocks
+
+Daemon:
+  --start-daemon          Start the login failure daemon
+  --stop-daemon           Stop the login failure daemon
+  --restart-daemon        Restart the login failure daemon
+
+Other:
+  -v, --version           Show version
+  -h, --help              Show this help
+
+Configuration: /etc/hostguard/hostguard.conf
+Logs:          /var/log/hostguard/daemon.log
+
+EOF
+}
+
+use POSIX qw(strftime);
