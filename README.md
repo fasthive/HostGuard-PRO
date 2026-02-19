@@ -111,7 +111,7 @@ hostguard -l                # List temporary blocks
 ## ⚙️ Installation
 
 ``` bash
-git clone https://github.com/yourusername/hostguard-pro.git
+git clone https://github.com/fasthive/hostguard-pro.git
 cd hostguard-pro
 bash install.sh
 ```
