@@ -1,99 +1,143 @@
-# FuseBilling
+# 🛡️ HostGuard Pro
 
+> Advanced Firewall & Real-Time Intrusion Protection for cPanel / WHM Servers
 
-**FuseBilling** is an all-in-one **automation and billing platform** for web hosting businesses, designers, resellers, and any online business. Automate **invoicing, payment processing, client management, and communication**.  
+HostGuard Pro is a high-performance firewall and brute-force protection suite built specifically for modern cPanel/WHM environments.
+It delivers real-time attack mitigation, intelligent login monitoring, and a fully integrated WHM interface, all with secure defaults and enterprise-grade stability.
 
----
+Designed for AlmaLinux, Rocky Linux, and CentOS-based cPanel servers.
 
-## 🚀 Features
+------------------------------------------------------------------------
 
-### Client Management 👥
-- Add, edit, and manage clients  
-- Track orders, invoices, payments, and subscriptions  
-- Client groups and custom pricing  
-- Account status management (active, suspended, terminated)  
-- Internal notes and communication  
+## 🚀 Why HostGuard Pro?
 
-### Billing & Invoicing 💳
-- Automatic or manual invoice generation  
-- Recurring invoices and subscriptions  
-- Overdue reminders and late fees  
-- Partial payments and payment plans  
-- PDF invoice generation and email delivery  
+Public-facing servers are constantly targeted by:
 
-### Payment Gateways 💰
-- Supports PayPal, Stripe, Authorize.net, and more  
-- One-time and recurring payments  
-- Refunds and transaction management  
-- Multi-currency support  
+-   Brute-force login attempts
+-   SSH abuse
+-   SMTP authentication attacks
+-   FTP scanning
+-   Web login probing
+-   Port scanning
+-   Distributed credential attacks
 
-### Product & Service Management 📦
-- Create hosting plans, SaaS subscriptions, or digital products  
-- Add-ons, configurable options, and product bundles  
-- Stock/availability management  
-- Automatic provisioning with cPanel, Plesk, DirectAdmin  
+HostGuard Pro continuously monitors your system and reacts within seconds blocking threats before they escalate.
 
-### Server & Automation ⚙️
-- Automatic account provisioning and suspension  
-- Integration with server panels  
-- Scheduled automation tasks  
-- API for custom integrations  
+------------------------------------------------------------------------
 
-### Support & Ticketing 🎫
-- Built-in ticket system  
-- Ticket assignment and tracking  
-- Custom statuses and priorities  
-- Email notifications for tickets and replies  
+## 🔥 Core Features
 
-### Reports & Analytics 📊
-- Revenue, sales, and client activity reports  
-- Subscription and churn analysis  
-- CSV/PDF export  
-- Dashboard analytics  
+### 🧱 Stateful Firewall Engine
 
-### Security & Permissions 🔒
-- Role-based access control for staff  
-- Two-factor authentication (2FA)  
-- Secure password hashing  
-- IP-based login restrictions  
-- Audit logs  
+-   Default deny inbound policy
+-   Allow established & related connections
+-   Configurable `TCP_IN`, `TCP_OUT`, `UDP_IN`, `UDP_OUT`
+-   IPv4 + IPv6 support
+-   iptables + ipset optimized rule sets
+-   Optional nftables detection
+-   Secure auto-allow protection during installation
+-   Built-in TEST mode to prevent accidental lockouts
 
-### Localization & Internationalization 🌎
-- Multi-language and multi-currency support  
-- Regional tax handling (VAT, GST, etc.)  
-- Customizable date, time, and number formats  
+------------------------------------------------------------------------
 
-### Extensibility & Integrations 🔗
-- API for custom apps  
-- Webhooks for real-time notifications  
-- Plugin/module support  
-- Integration with email, SMS, and CRM services  
+### 🧠 Real-Time Login Protection
 
-### Notifications & Communication 📬
-- Email notifications for invoices, payments, and tickets  
-- SMS notifications via compatible gateways  
-- Customizable templates  
+HostGuard Pro includes a persistent background daemon (`hostguardd`) that:
 
-### Miscellaneous ✨
-- Custom branding for invoices and client portal  
-- Dark/light mode portal  
-- Advanced search and filtering  
-- Backup and restore options  
-- Audit trails and activity logs  
+-   Monitors authentication logs continuously
+-   Detects brute-force behavior instantly
+-   Aggregates login attempts across multiple services
+-   Blocks attackers automatically
+-   Supports temporary blocks with automatic expiry
+-   Optionally promotes repeat offenders to permanent block
+-   Handles log rotation gracefully
 
----
+Supported detection targets include:
 
-## 💡 Uses
+-   SSH
+-   WHM / cPanel logins
+-   Exim (SMTP AUTH)
+-   Dovecot (IMAP / POP3)
+-   FTP services
+-   Web authentication logs
 
-FuseBilling can support **any online business**:
+------------------------------------------------------------------------
 
-| Use Case | Description | Icon |
-|----------|-------------|------|
-| **Web Hosting Providers** | Automate client onboarding, billing, and server provisioning. | 🖥️ |
-| **Digital Product Sellers** | Manage subscriptions, license keys, and one-time purchases. | 💾 |
-| **Freelancers & Agencies** | Streamline invoicing, recurring payments, and client communication. | ✍️ |
-| **SaaS Businesses** | Handle subscription management, upgrades, and cancellations. | ☁️ |
-| **Resellers & Designers** | Offer packaged services with automated invoicing and support. | 🎨 |
-| **Any Online Business** | Manage customers, payments, and services in one platform. | 🌐 |
+## 🖥️ Native WHM Integration
 
----
+Access HostGuard Pro directly inside WHM:
+
+**WHM → HostGuard Pro**
+
+Features:
+
+-   📊 Live Dashboard (status, recent blocks, system overview)
+-   ⚙️ Firewall Configuration Editor
+-   🧾 Allowlist / Denylist / Ignore Manager
+-   ⏳ Temporary Blocks Viewer with One-Click Unblock
+-   🔄 Service Controls (Start / Stop / Restart / Reload)
+-   📜 Integrated Log Viewer
+
+------------------------------------------------------------------------
+
+## 💻 Command Line Interface
+
+HostGuard Pro provides a powerful CLI for system administrators:
+
+``` bash
+hostguard -e                # Enable firewall
+hostguard -x                # Disable firewall
+hostguard -r                # Reload firewall rules
+hostguard -a <ip> [note]    # Allow IP
+hostguard -d <ip> [note]    # Deny IP
+hostguard -tr <ip>          # Remove temporary block
+hostguard -g <ip>           # Search IP in configuration
+hostguard -l                # List temporary blocks
+```
+
+------------------------------------------------------------------------
+
+## 📂 Directory Structure
+
+    /etc/hostguard/               # Configuration files
+    /usr/local/hostguard/bin/     # CLI & core scripts
+    /usr/local/hostguard/lib/     # Internal modules
+    /usr/local/hostguard/tpl/     # Alert templates
+    /var/lib/hostguard/           # Runtime data & counters
+    /var/log/hostguard/           # Daemon logs
+
+------------------------------------------------------------------------
+
+## ⚙️ Installation
+
+``` bash
+git clone https://github.com/yourusername/hostguard-pro.git
+cd hostguard-pro
+bash install.sh
+```
+
+------------------------------------------------------------------------
+
+## 🔄 Uninstallation
+
+``` bash
+bash uninstall.sh
+```
+
+------------------------------------------------------------------------
+
+## 🔐 Security Architecture
+
+-   Strong validation for IP/CIDR/port inputs
+-   No unsafe shell execution
+-   Secure configuration file permissions
+-   Allowlist priority override
+-   Safe recovery mechanisms
+
+------------------------------------------------------------------------
+
+# HostGuard Pro
+
+Secure your infrastructure.
+React instantly.
+Control everything from WHM.
