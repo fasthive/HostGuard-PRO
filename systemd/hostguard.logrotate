@@ -1,1 +1,12 @@
-
+/var/log/hostguard/daemon.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root root
+    postrotate
+        /bin/kill -HUP $(cat /run/hostguardd.pid 2>/dev/null) 2>/dev/null || true
+    endscript
+}
